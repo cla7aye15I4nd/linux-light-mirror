@@ -1,0 +1,83 @@
+name: Update Linux snapshot
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-light-mirror-update
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: torvalds/linux
+  UPSTREAM_REF: master
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out current snapshot
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Fetch upstream and replace the snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_dir="${RUNNER_TEMP}/linux-upstream"
+          control_dir="${RUNNER_TEMP}/mirror-control"
+
+          git clone \
+            --depth=1 \
+            --filter=blob:none \
+            --single-branch \
+            --branch="${UPSTREAM_REF}" \
+            "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+            "${upstream_dir}"
+
+          upstream_sha="$(git -C "${upstream_dir}" rev-parse HEAD)"
+          current_sha="$(tr -d '\n' < .upstream-commit 2>/dev/null || true)"
+          if [[ "${upstream_sha}" == "${current_sha}" ]]; then
+            echo "Already at ${UPSTREAM_REPOSITORY}@${upstream_sha}."
+            exit 0
+          fi
+
+          upstream_date="$(git -C "${upstream_dir}" show -s --format=%cI HEAD)"
+          upstream_subject="$(git -C "${upstream_dir}" show -s --format=%s HEAD)"
+
+          mkdir -p "${control_dir}/.github/workflows"
+          cp .github/workflows/update-mirror.yml "${control_dir}/.github/workflows/update-mirror.yml"
+          cp MIRROR.md "${control_dir}/MIRROR.md"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan next-snapshot
+          git rm -rf .
+
+          rsync -a --exclude='.git/' --exclude='.github/' "${upstream_dir}/" ./
+          mkdir -p .github/workflows
+          cp "${control_dir}/.github/workflows/update-mirror.yml" .github/workflows/update-mirror.yml
+          cp "${control_dir}/MIRROR.md" MIRROR.md
+          printf '%s\n' "${upstream_sha}" > .upstream-commit
+
+          git add -A
+          git add -f .github/workflows/update-mirror.yml .upstream-commit MIRROR.md
+          {
+            printf 'Snapshot %s@%s\n\n' "${UPSTREAM_REPOSITORY}" "${upstream_sha}"
+            printf 'Upstream-Repository: https://github.com/%s\n' "${UPSTREAM_REPOSITORY}"
+            printf 'Upstream-Ref: %s\n' "${UPSTREAM_REF}"
+            printf 'Upstream-Commit: %s\n' "${upstream_sha}"
+            printf 'Upstream-Commit-Date: %s\n' "${upstream_date}"
+            printf 'Upstream-Subject: %s\n' "${upstream_subject}"
+          } > "${RUNNER_TEMP}/snapshot-commit-message"
+
+          git commit --file="${RUNNER_TEMP}/snapshot-commit-message"
+          git push --force origin HEAD:main
